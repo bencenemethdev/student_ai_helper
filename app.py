@@ -3,7 +3,19 @@ from datetime import date
 
 import streamlit as st
 
+from studentHelper import (
+    build_chunks_from_pdfs,
+    build_vector_index,
+    generate_flashcards,
+    generate_study_plan,
+    rag_chat,
+)
+import os
+
 st.set_page_config(page_title="Student Helper AI", layout="wide")
+
+if "GROQ_API_KEY" in st.secrets and str(st.secrets["GROQ_API_KEY"]).strip():
+    os.environ["GROQ_API_KEY"] = str(st.secrets["GROQ_API_KEY"]).strip()
 
 # --- Session State Initialization ---
 if "messages" not in st.session_state:
@@ -23,18 +35,17 @@ if "pending_navigation" not in st.session_state:
 if "study_plan" not in st.session_state:
     st.session_state.study_plan = []
 
-FLASHCARDS = [
-    {"question": "What is the capital of France?", "answer": "Paris"},
-    {"question": "What is the largest planet in our solar system?", "answer": "Jupiter"},
-    {"question": "In what year did World War II end?", "answer": "1945"},
-]
 
-MOCK_STUDY_PLAN = [
-    {"date": "2026-04-01", "task": "Read Chapter 1", "hours": 2},
-    {"date": "2026-04-02", "task": "Read Chapter 2", "hours": 2},
-    {"date": "2026-04-03", "task": "Practice problems", "hours": 2},
-]
-
+if "flashcards" not in st.session_state:
+    st.session_state.flashcards = []
+if "chunks" not in st.session_state:
+    st.session_state.chunks = []
+if "chunk_stats" not in st.session_state:
+    st.session_state.chunk_stats = None
+if "vdb" not in st.session_state:
+    st.session_state.vdb = None
+if "chunk_id_to_date" not in st.session_state:
+    st.session_state.chunk_id_to_date = {}
 
 def generate_mock_ics(plan_items):
     events = [
@@ -57,6 +68,12 @@ def generate_mock_ics(plan_items):
 
     events.append("END:VCALENDAR")
     return "\n".join(events)
+
+
+def _has_groq_key() -> bool:
+    if "GROQ_API_KEY" in st.secrets and str(st.secrets["GROQ_API_KEY"]).strip():
+        return True
+    return bool(os.environ.get("GROQ_API_KEY", "").strip())
 
 
 col1, col2 = st.columns([1, 2])
@@ -89,10 +106,38 @@ with col1:
 
     generate_plan = st.button("Generate Study Plan", use_container_width=True)
     if generate_plan:
-        st.session_state.study_plan = MOCK_STUDY_PLAN.copy()
+        if not uploaded_files:
+            st.warning("Please upload at least one PDF.")
+        elif not _has_groq_key():
+            st.error("Missing Groq API key. Set `GROQ_API_KEY` (env var) or add it to Streamlit secrets.")
+        else:
+            with st.spinner("Processing PDFs and generating study plan..."):
+                chunks, stats = build_chunks_from_pdfs(uploaded_files)
+                vdb = build_vector_index(chunks)
+                plan, chunk_id_to_date = generate_study_plan(
+                    chunks=chunks,
+                    current_date=simulated_date,
+                    exam_date=exam_date,
+                    daily_hours=int(daily_hours),
+                )
+
+                st.session_state.chunks = chunks
+                st.session_state.chunk_stats = stats
+                st.session_state.vdb = vdb
+                st.session_state.chunk_id_to_date = chunk_id_to_date
+                st.session_state.study_plan = plan
+
+                st.session_state.flashcards = []
+                st.session_state.flashcard_index = 0
+                st.session_state.flashcard_flipped = False
 
     if st.session_state.study_plan:
-        st.subheader("Mockup Study Schedule")
+        st.subheader("Study Schedule")
+        if st.session_state.chunk_stats:
+            s = st.session_state.chunk_stats
+            st.caption(
+                f"Processed {s['files']} file(s), {s['pages']} page(s), {s['chunks']} chunk(s)."
+            )
         for item in st.session_state.study_plan:
             st.markdown(f"- **{item['date']}:** {item['task']} ({item['hours']}h)")
 
@@ -113,6 +158,18 @@ with col2:
     if not st.session_state.show_flashcard:
         flashcard_btn = st.button("Test My Knowledge (Flashcards)", use_container_width=True)
         if flashcard_btn:
+            if not st.session_state.vdb:
+                st.warning("Generate a study plan first so I can build flashcards from your PDFs.")
+            elif not _has_groq_key():
+                st.error("Missing Groq API key. Set `GROQ_API_KEY` (env var) or add it to Streamlit secrets.")
+            else:
+                with st.spinner("Generating flashcards from your study material..."):
+                    st.session_state.flashcards = generate_flashcards(
+                        vdb=st.session_state.vdb,
+                        chunk_id_to_date=st.session_state.chunk_id_to_date,
+                        current_date=simulated_date,
+                        n_cards=5,
+                    )
             st.session_state.show_flashcard = True
             st.session_state.flashcard_answer_revealed = False
             st.session_state.flashcard_index = 0
@@ -173,7 +230,11 @@ with col2:
                     st.session_state.flashcard_flipped = False
                     st.rerun()
 
-            current_card = FLASHCARDS[st.session_state.flashcard_index]
+            cards = st.session_state.flashcards or [
+                {"question": "No flashcards available yet", "answer": "Generate a study plan and try again."}
+            ]
+            st.session_state.flashcard_index = st.session_state.flashcard_index % len(cards)
+            current_card = cards[st.session_state.flashcard_index]
             flip_class = "flipped" if st.session_state.flashcard_flipped else ""
             col_prev, col_card, col_next = st.columns([0.5, 3, 0.5], vertical_alignment="center")
 
@@ -184,7 +245,7 @@ with col2:
                         st.session_state.pending_navigation = "prev"
                         st.rerun()
                     else:
-                        st.session_state.flashcard_index = (st.session_state.flashcard_index - 1) % len(FLASHCARDS)
+                        st.session_state.flashcard_index = (st.session_state.flashcard_index - 1) % len(cards)
                         st.rerun()
 
             with col_card:
@@ -194,7 +255,7 @@ with col2:
                     <div style="perspective: 1200px; display: flex; justify-content: center; align-items: center; min-height: 350px; position: relative;">
                         <div class="flashcard-flip {flip_class}">
                             <div class="flashcard-face" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
-                                <div style="font-size: 0.9em; opacity: 0.9;">Question {st.session_state.flashcard_index + 1} / {len(FLASHCARDS)}</div>
+                                <div style="font-size: 0.9em; opacity: 0.9;">Question {st.session_state.flashcard_index + 1} / {len(cards)}</div>
                                 <div style="font-size: 1.3em; text-align: center; margin: 1em 0;"><b>{current_card['question']}</b></div>
                             </div>
                             <div class="flashcard-face back" style="background: linear-gradient(135deg, #764ba2 0%, #667eea 100%);">
@@ -218,15 +279,15 @@ with col2:
                         st.session_state.pending_navigation = "next"
                         st.rerun()
                     else:
-                        st.session_state.flashcard_index = (st.session_state.flashcard_index + 1) % len(FLASHCARDS)
+                        st.session_state.flashcard_index = (st.session_state.flashcard_index + 1) % len(cards)
                         st.rerun()
 
             if st.session_state.pending_navigation:
                 time.sleep(0.225)
                 st.session_state.flashcard_index = (
-                    (st.session_state.flashcard_index - 1) % len(FLASHCARDS)
+                    (st.session_state.flashcard_index - 1) % len(cards)
                     if st.session_state.pending_navigation == "prev"
-                    else (st.session_state.flashcard_index + 1) % len(FLASHCARDS)
+                    else (st.session_state.flashcard_index + 1) % len(cards)
                 )
                 st.session_state.pending_navigation = None
                 st.rerun()
@@ -243,7 +304,20 @@ with col2:
                 st.markdown(user_input)
             st.session_state.messages.append({"role": "user", "content": user_input})
 
-            ai_response = "[Mocked AI Response] I'm here to help you with your study material!"
+            if not st.session_state.vdb:
+                ai_response = "Please upload PDFs and click **Generate Study Plan** first so I can answer from your material."
+            elif not _has_groq_key():
+                ai_response = "Missing Groq API key. Set `GROQ_API_KEY` (env var) or add it to Streamlit secrets."
+            else:
+                with st.spinner("Searching your materials..."):
+                    ai_response = rag_chat(
+                        vdb=st.session_state.vdb,
+                        chunk_id_to_date=st.session_state.chunk_id_to_date,
+                        question=user_input,
+                        current_date=simulated_date,
+                        model="llama-3.3-70b-versatile",
+                    )
+
             with st.chat_message("assistant"):
                 st.markdown(ai_response)
             st.session_state.messages.append({"role": "assistant", "content": ai_response})

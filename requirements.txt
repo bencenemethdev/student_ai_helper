@@ -1,1 +1,6 @@
 streamlit
+faiss-cpu
+numpy
+pypdf
+tiktoken
+sentence-transformers
