@@ -4,3 +4,5 @@ numpy
 pypdf
 tiktoken
 sentence-transformers
+langchain-text-splitters
+openai
